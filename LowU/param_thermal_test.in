@@ -1,0 +1,12 @@
+__nk=200
+__numOfFreq=4000
+__freq_cutoff=20.0
+__t_hop=1.0
+__delta_cav=2.0
+__Gamma_cav=2.0
+__g_eff_sq=0.02
+__Niter=80
+__mixing=0.5
+__err=1e-11
+__Jbath=0.05
+__beta_test=-1
