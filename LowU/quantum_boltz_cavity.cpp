@@ -1,13 +1,13 @@
 // quantum_boltz_cavity.cpp
-// Steady-state Keldysh DMFT for the Hubbard model coupled to a driven-dissipative cavity
-// 2-site unit cell, 1D chain (extendable to 2D via transverse dispersion)
+// Steady-state Keldysh Dyson equation for the Hubbard model coupled to a driven-dissipative cavity
+// 2-site unit cell, 1D chain
 //
 // Self-consistent perturbation theory:
 //   - 2nd order (IPT) Hubbard self-energy, element-wise in sublattice indices
 //   - Cavity-mediated Fock self-energy (non-equilibrium, no FDT)
 //   - Cavity Hartree (self-consistent phi)
 //   - Explicit k-summation for G_loc (no Bethe lattice trick)
-//   - Markovian bath for broadening
+//   - Markovian bath for broadening the staring GF
 
 #include <iostream>
 #include <iomanip>
@@ -18,7 +18,6 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
-#include <sstream>
 #include "omp.h"
 #include "./find_param.h"
 #include "./ness_decls.hpp"
@@ -91,16 +90,10 @@ inline cdmatrix tau_z_sandwich(const cdmatrix &M) {
 }
 
 // ================================================================
-// Cavity propagator (symmetrized, scalar)
+// Symmetrized cavity propagator from Eq. (10)
 //
-// D~^R(w) = delta / ((w + i*Gamma/2)^2 - delta^2)
-// D~^K(w) = -i*Gamma/2 * [1/((w-delta)^2 + Gamma^2/4)
-//                        + 1/((w+delta)^2 + Gamma^2/4)]
-// D^< = (D^K - D^R + D^A) / 2,  with D^A = conj(D^R)
+// eval_D evaluates D^R, D^K at an arbitrary (generally off-grid) frequency, so that the analytic cavity self-energy below never needs to interpolate the tabulated Dcav grid.
 //
-// eval_D evaluates D^R, D^K at an arbitrary (generally off-grid) frequency,
-// so that the analytic cavity self-energy below never needs to interpolate
-// the tabulated Dcav grid.
 // ================================================================
 
 void eval_D(double omega, double delta, double Gamma, cplx &DR, cplx &DK) {
@@ -116,8 +109,7 @@ void eval_D(double omega, double delta, double Gamma, cplx &DR, cplx &DK) {
     DK = -ii * G2 * (1.0 / d1 + 1.0 / d2);
 }
 
-// Same D^R (causal structure fixed by delta, Gamma) but with D^K replaced by
-// its EXACT thermal/FDT value at inverse temperature beta:
+// Same D^R (causal structure fixed by delta, Gamma) but with D^K replaced by its exact thermal FDT value at inverse temperature beta:
 //   D^K(w) = coth(beta*w/2) * (D^R(w) - D^A(w))
 // Used only for the thermal-FDT regression test below.
 void eval_D_thermal(double omega, double delta, double Gamma, double beta,
@@ -145,39 +137,12 @@ void set_cavity_propagator(double delta, double Gamma, GF &Dcav) {
 }
 
 // ================================================================
-// Analytic cavity self-energy (sharp-quasiparticle / full k-dependence)
+// Analytic cavity self-energy (sharp-quasiparticle + full k-dependence)
 //
-// For each k, h_k + Hartree is diagonalized into two quasiparticle bands
-// nu = -,+ with energy eps_{k,nu} and projector P_{k,nu}. The cavity
-// self-energy is diagonal in k (q=0 boson exchange) and, assuming sharp
-// quasiparticles, has the closed form (F = distribution function,
-// D~ = symmetrized cavity propagator from eval_D):
+// Starting from Eq. (21) and performing a quasi particle approximation, the expression of the cavity self-energy only relies of the occupation of mode (k,nu) and the symmetrized cavity propagators. As explained in App. C, the occupation are extracted from the evaluation of the local distribution function evaluted at the mean-field energies. Thus, the fully k-dependent self-energy is approximated in the quasi-particle limit without having to store the k-dependent self-energy.
 //
-//   Sigma^R_cav(k,w) - Sigma^A_cav(k,w) =
-//     g_eff_sq * sum_nu { D~^K(w-eps_{k,nu})
-//                        + F(eps_{k,nu}) * [D~^R(w-eps_{k,nu}) - D~^A(w-eps_{k,nu})] }
-//                * tz P_{k,nu} tz
+// Only the antihermitian/dissipative part is kept.
 //
-//   Sigma^<_cav(k,w) =
-//     -g_eff_sq * sum_nu { D~^K(w-eps_{k,nu})
-//                        - [D~^R(w-eps_{k,nu}) - D~^A(w-eps_{k,nu})] }
-//                * (1 - F(eps_{k,nu}))/2 * tz P_{k,nu} tz
-//
-// (the overall minus sign on Sigma^<_cav, absent from the literal formula, is
-// an empirically-confirmed correction: without it, feeding the exact
-// equilibrium F(eps)=tanh(beta*eps/2) into the Dyson equation with no other
-// source of damping gives a sign-inverted, unphysical density; with it,
-// density converges to the correct value -- see conversation history for the
-// isolation of this sign, most likely a Keldysh-contour sign convention
-// mismatch between the original derivation and this code's G^</G^R
-// conventions).
-//
-// Sigma^R_cav is then taken as half of the antihermitian combination above
-// (i.e. only the antihermitian/dissipative part is kept, matching the
-// convention used previously for the FFT-based cavity self-energy).
-//
-// No FFT and no full k-resolved GF storage are needed: only the O(nk)
-// band energies/projectors and the O(nk) values of F at those energies.
 // ================================================================
 
 struct BandData {
@@ -211,26 +176,9 @@ vector<array<cdmatrix, 2>> compute_TPT(const vector<BandData> &bands) {
     return TPT;
 }
 
-// Extract a single, k-independent distribution function F(eps_{k,nu}) from
-// the local GF via
-//   (1-F(w))/2 = - Im tr Gloc^<(w) / (2 Im tr Gloc^R(w))
-// (the minus sign matches this code's G^< = f*(G^A-G^R) convention, f the
-// physical occupation, so that (1-F)/2 = f as needed by the Sigma_cav
-// formulas above), binned around each of the 2*nk quasiparticle energies
-// eps_{k,nu} (the omega-grid is finer than the k-grid, so several omega
-// points contribute to each bin).
+// Extract a single, k-dependent distribution function F(eps_{k,nu}) from the local GF via (1-F(w))/2 = - Im tr Gloc^<(w) / (2 Im tr Gloc^R(w)) binned around each of the 2*nk quasiparticle energies eps_{k,nu} (the omega-grid is finer than the k-grid, so several omega points contribute to each bin).
 //
-// The dispersion has van Hove points (dEps/dk -> 0) at k=0 and k=pi, so many
-// k (not just the exact k<->-k pair) pile up into an energy window narrower
-// than the omega-grid spacing near the band edges -- not just exact
-// degeneracies. So rather than merging by an energy tolerance, neighbouring
-// raw bins (one per sorted eps_{k,nu}, edges at midpoints between sorted
-// neighbours) are greedily merged, left to right, until each accumulated
-// group has at least min_pts omega-grid points -- this handles exact
-// degeneracies (from k<->-k) and van Hove crowding uniformly, since both
-// just mean "too few omega points in this energy window". Omega points
-// beyond the two extremal (symmetric-width) edges are dropped as
-// incoherent/off-shell weight.
+// The dispersion has van Hove points (dEps/dk -> 0) at k=0 and k=pi, so many k (not just the exact k<->-k pair) pile up into an energy window narrower than the omega-grid spacing near the band edges -- not just exact degeneracies. So rather than merging by an energy tolerance, neighbouring raw bins (one per sorted eps_{k,nu}, edges at midpoints between sorted neighbours) are greedily merged, left to right, until each accumulated group has at least min_pts omega-grid points -- this handles exact degeneracies (from k<->-k) and van Hove crowding uniformly, since both just mean "too few omega points in this energy window". Omega points beyond the two extremal (symmetric-width) edges are dropped as incoherent/off-shell weight.
 void extract_F_binned(const GF &Gloc, const vector<BandData> &bands,
                       vector<array<double, 2>> &F_k) {
     int nk = bands.size();
@@ -326,11 +274,7 @@ void extract_F_binned(const GF &Gloc, const vector<BandData> &bands,
             }
             ratio = (abs(den[best]) > 1e-14) ? num[best] / den[best] : 0.0;
         }
-        // Note: the code's convention (force_equi/DensityMatrix) gives
-        // G^< = f*(G^A-G^R) with f the physical occupation, so identically
-        // num/den = Im tr G^< / Im tr G^R = -2f (no extra factor of 2 beyond
-        // this -- ratio here is num/den, not num/(2 den)). F is defined such
-        // that (1-F)/2 = f, i.e. F = 1-2f = 1 + ratio.
+
         double Fval = 1.0 + ratio;
 
         n_groups++;
@@ -338,13 +282,7 @@ void extract_F_binned(const GF &Gloc, const vector<BandData> &bands,
             n_out_of_range++;
             double excess = max(Fval - 1.0, -1.0 - Fval);
             if (excess > worst) worst = excess;
-            // F is a physical occupation-like quantity, bounded in [-1,1] by
-            // construction (and the Sigma_cav formulas are only guaranteed
-            // causal for F in that range, see eval_Sigma_cav_k). An estimate
-            // outside it is a resolution artifact (too few omega points, or
-            // this bin straddling incoherent weight), not real physics --
-            // clamp rather than feed an acausal Sigma_cav back into Gloc.
-            Fval = max(-1.0, min(1.0, Fval));
+            Fval = max(-1.0, min(1.0, Fval)); // Saturates F within [- 1 , 1], which is its physical values.  
         }
         for (int m = i; m <= j; m++) Fsorted[m] = Fval;
 
@@ -363,87 +301,15 @@ void extract_F_binned(const GF &Gloc, const vector<BandData> &bands,
     }
 }
 
-// Direct (non-binned) extraction of F(eps_{k,nu}): linearly interpolate
-// Im tr G^<_loc(w) and Im tr G^R_loc(w) separately onto each (generally
-// off-grid) eps_{k,nu), then F = 1 + Im(interp G^<)/Im(interp G^R) (same
-// sign/normalization as extract_F_binned above). No bin construction at all
-// -- for nk large enough that the pointwise ratio curve is smooth, this is
-// simpler and avoids the degeneracy/van-Hove-crowding/edge-bin machinery
-// that binning needs. eps_{k,nu} outside the omega grid are clamped to the
-// nearest edge point.
-void extract_F_direct(const GF &Gloc, const vector<BandData> &bands,
-                      vector<array<double, 2>> &F_k) {
-    int nk = bands.size();
-    F_k.assign(nk, {0.5, 0.5});
-    if (nk == 0) return;
-
-    long N = Gloc.ngrid_;
-    vector<double> omega(N), num(N), den(N);
-    for (long w = 0; w < N; w++) {
-        omega[w] = Gloc.grid_[w];
-        num[w] = Gloc.Lesser[w].trace().imag();
-        den[w] = Gloc.Retarded[w].trace().imag();
-    }
-    vector<long> wo(N);
-    iota(wo.begin(), wo.end(), 0);
-    sort(wo.begin(), wo.end(), [&](long a, long b) { return omega[a] < omega[b]; });
-    vector<double> sortedOmega(N);
-    for (long ii = 0; ii < N; ii++) sortedOmega[ii] = omega[wo[ii]];
-
-    int n_out_of_range = 0;
-    double worst = 0.0;
-
-    for (int k = 0; k < nk; k++) {
-        for (int nu = 0; nu < 2; nu++) {
-            double e = bands[k].eps[nu];
-            double numI, denI;
-
-            if (e <= sortedOmega.front()) {
-                numI = num[wo.front()];
-                denI = den[wo.front()];
-            } else if (e >= sortedOmega.back()) {
-                numI = num[wo.back()];
-                denI = den[wo.back()];
-            } else {
-                auto it = lower_bound(sortedOmega.begin(), sortedOmega.end(), e);
-                long i1 = it - sortedOmega.begin();
-                long i0 = i1 - 1;
-                double w0 = sortedOmega[i0], w1 = sortedOmega[i1];
-                double t = (w1 > w0) ? (e - w0) / (w1 - w0) : 0.0;
-                long a0 = wo[i0], a1 = wo[i1];
-                numI = num[a0] + t * (num[a1] - num[a0]);
-                denI = den[a0] + t * (den[a1] - den[a0]);
-            }
-
-            double ratio = (abs(denI) > 1e-14) ? numI / denI : 0.0;
-            double Fval = 1.0 + ratio;
-
-            if (Fval < -1.0 || Fval > 1.0) {
-                n_out_of_range++;
-                double excess = max(Fval - 1.0, -1.0 - Fval);
-                if (excess > worst) worst = excess;
-                Fval = max(-1.0, min(1.0, Fval)); // see extract_F_binned: physical bound
-            }
-            F_k[k][nu] = Fval;
-        }
-    }
-
-    if (n_out_of_range > 0) {
-        cout << "  [extract_F_direct] WARNING: " << n_out_of_range << "/" << (2 * nk)
-             << " F(eps_k,nu) values outside [-1,1] (max excess = " << worst << ")" << endl;
-    }
-}
-
-// Sigma^R_cav(k,w), Sigma^<_cav(k,w) from the analytic formulas above,
-// for a single k (TPT[nu] = tz P_{k,nu} tz, F[nu] = F(eps_{k,nu})).
+// Computes Sigma^R_cav(k,w), Sigma^<_cav(k,w) from the analytic formulas above, for a single k.
 // beta_thermal < 0 (default): use the real driven-dissipative D (eval_D).
-// beta_thermal >= 0: FDT-regression-test mode -- use eval_D_thermal instead,
-// i.e. force the photon to be exactly thermal at that inverse temperature.
+// beta_thermal >= 0: FDT-regression-test mode -- use eval_D_thermal instead, i.e. force the photon to be exactly thermal at that inverse temperature.
 void eval_Sigma_cav_k(double omega, const array<double, 2> &eps,
                       const array<cdmatrix, 2> &TPT, const array<double, 2> &F,
                       double g_eff_sq, double delta_cav, double Gamma_cav,
                       cdmatrix &SigCavR, cdmatrix &SigCavL,
                       double beta_thermal = -1.0) {
+    // Notation : TPT[nu] = tz P_{k,nu} tz, F[nu] = F(eps_{k,nu})
     SigCavR = cdmatrix::Zero(2, 2);
     SigCavL = cdmatrix::Zero(2, 2);
     if (g_eff_sq < 1e-15) return; // in place modification of SigCavL/R
@@ -466,11 +332,6 @@ void eval_Sigma_cav_k(double omega, const array<double, 2> &eps,
 
     SigCavR = 0.5 * g_eff_sq * sumRA;
     {
-        // NOTE: must copy into a temporary before using .adjoint() here --
-        // "X = 0.5*(X - X.adjoint())" is an Eigen self-aliasing hazard
-        // (.adjoint() = .transpose().conjugate(), same index-permutation-
-        // under-self-assignment issue as the GkR = 0.5*(GkR+GkR.transpose())
-        // bug found in compute_gloc_ksum).
         cdmatrix tmp = SigCavR;
         SigCavR = 0.5 * (tmp - tmp.adjoint()); // enforce antihermiticity numerically
     }
@@ -482,10 +343,7 @@ void eval_Sigma_cav_k(double omega, const array<double, 2> &eps,
 }
 
 // ================================================================
-// Hubbard self-energy: 2nd order, element-wise in sublattice indices
-//
-// [Sigma^<]_{ab}(t)  = (G^<_{ab})^2 * (-conj(G^>_{ab}))
-// [Sigma^R]_{ab}(t)  = (G^>_{ab})^2 * (-conj(G^<_{ab})) - Sigma^<_{ab}
+// Local Hubbard self-energy from Eq. (56).
 //
 // This uses G^>_{ab}(-t) = -conj(G^>_{ab}(t)) (steady-state relation)
 // Multiply by U^2 at the end.
@@ -523,8 +381,6 @@ void compute_Sigma_hubbard(double U, const GF &Gloc, GF &Sigma_hub,
 
     tSigma.smul(U * U);
     tSigma.reset_grid(tG.dgrid_);
-    // Greater(0) returns true G^>(0+), so products at t=0 are true values;
-    // apply factor 0.5 to match the FFT convention for retarded at t=0
     tSigma.Retarded[0] *= 0.5;
     tSigma.Retarded[Nt - 1].setZero();
 
@@ -533,7 +389,7 @@ void compute_Sigma_hubbard(double U, const GF &Gloc, GF &Sigma_hub,
 }
 
 // ================================================================
-// Cavity Hartree (Hubbard Hartree set to 0)
+// Cavity Hartree (Hubbard Hartree absorbed in the chemical potential)
 //
 // phi = -2*g*delta / (delta^2 + Gamma^2/4) * (n_0 - n_1)
 // Hartree = g * phi * tau_z
@@ -561,31 +417,12 @@ void compute_hartree(double g_cav, double delta, double Gamma,
 // ================================================================
 // k-grid for 1D chain, 2-site unit cell
 //
-// h(k) = -t*(1+cos k)*tau_x - t*sin(k)*tau_y + (eps_perp - mu)*I
-//      = [ eps_perp - mu,       -t*(1 + e^{-ik}) ]
-//        [ -t*(1 + e^{ik}),     eps_perp - mu    ]
+// - k uniformly in [0,pi] using the inversion symmetry
 //
-// Uniform weights (trapezoidal rule, optimal for periodic integrands).
+// - Uniform weights
 //
-// Reduced to k in [0,pi]: h(2*pi-k) = h(k)^T exactly (off-diagonal entries
-// swap), so G_{2*pi-k} = G_k^T. Every quantity this code reads off Gloc
-// (individual diagonal elements n0/n1, and Im-tr-based ratios in
-// extract_F_binned) is invariant under transpose, so visiting only k in
-// [0,pi] with the interior points double-weighted (they represent two
-// physical k, k and 2*pi-k) reproduces those exactly, at roughly half the
-// per-(k,w) matrix work. compute_gloc_ksum additionally symmetrizes
-// (G_k+G_k^T)/2 before accumulating, so even Gloc's off-diagonal elements
-// come out exactly right (at no extra inversion cost -- just a transpose).
-// The two endpoints k=0 and k=pi (when nk is even) are their own mirror
-// image (2*pi-0=0, 2*pi-pi=pi) and keep single weight, not doubled.
+// - h(k) defined in Eq. (24)
 //
-// nk keeps its original meaning (sets the k-grid spacing dk=2*pi/nk, same
-// physical resolution as before); the number of points actually stored
-// (hk.size()) is roughly nk/2+1, not nk -- callers should re-read nk as
-// hk.size() after calling this.
-//
-// TODO for 2D: add an outer loop over eps_perp with a transverse DOS,
-// e.g. semicircular for Bethe lattice or explicit k_perp summation.
 // ================================================================
 
 void setup_kgrid(int nk, double t_hop, double mu, double eps_perp,
@@ -614,22 +451,14 @@ void setup_kgrid(int nk, double t_hop, double mu, double eps_perp,
 }
 
 // ================================================================
-// G_loc via explicit k-summation
+// G_loc via explicit k-summation Eq. (55). 
 //
-// G_k^R(w) = (w*I - h_k - Hartree - Sigma_hub^R(w) - Sigma_cav^R(k,w))^{-1}
-// G_k^<(w) = G_k^R * (Sigma_hub^<(w) + Sigma_cav^<(k,w)) * G_k^A
-// G_loc(w) = sum_k w_k * G_k(w)
-//
-// Sigma_hub is local (k-independent, from FFT convolution on Gloc, as
-// before). Sigma_cav is k-dependent and built analytically at each k from
-// the quasiparticle bands/projectors and the distribution function F_k
-// (see eval_Sigma_cav_k above) -- no FFT and no full k-resolved GF storage
-// needed for the cavity part.
+// Sigma_hub is local (k-independent, from FFT convolution on Gloc). Sigma_cav is k-dependent and built analytically at each k from the quasiparticle bands/projectors and the distribution function F_k (see eval_Sigma_cav_k above) -- no full k-resolved GF storage needed for the cavity part.
 //
 // hk/wk only cover k in [0,pi] (see setup_kgrid): each G_k is symmetrized,
 // (G_k+G_k^T)/2, before being weighted and accumulated. This costs nothing
 // extra (no second inversion, just a transpose) and makes the sum exactly
-// equal to summing over the full k in [0,2*pi) (see setup_kgrid for why).
+// equal to summing over the full k in [0,2*pi). 
 // ================================================================
 
 void compute_gloc_ksum(int nk, const vector<cdmatrix> &hk,
@@ -662,12 +491,6 @@ void compute_gloc_ksum(int nk, const vector<cdmatrix> &hk,
 
             cdmatrix GkR = (omega * I2 - hk[k] - Hartree - SigR).inverse();
             cdmatrix GkL = GkR * SigL * GkR.adjoint();
-            // NOTE: GkR.transpose() (an expression referencing GkR's own storage)
-            // must be evaluated into a plain temporary before assigning back into
-            // GkR -- "GkR = 0.5*(GkR+GkR.transpose())" is Eigen's classic aliasing
-            // trap (mat = mat.transpose() corrupts off-diagonal entries) and was a
-            // real bug here (diagonal elements happened to survive since transpose
-            // doesn't move them, which is exactly why it went unnoticed at first).
             cdmatrix GkR_T = GkR.transpose();
             cdmatrix GkL_T = GkL.transpose();
             GkR = 0.5 * (GkR + GkR_T);
@@ -1070,9 +893,6 @@ int main(int argc, char **argv) {
         //    k-dependent cavity self-energy evaluated inside compute_gloc_ksum.
         compute_bands_k(hk, Hartree, bands);
         extract_F_binned(Gloc, bands, F_k);
-        // extract_F_direct(Gloc, bands, F_k); // pointwise/interpolated alternative,
-        // valid once nk is large enough that Im tr G^R is smooth on the omega grid
-        // (empirically not yet the case at nk=200 -- see conversation).
 
         // 4. New G_loc from k-summation (Hubbard local + cavity k-dependent)
         compute_gloc_ksum(nk, hk, wk, Hartree, Sigma_hub, bands, F_k,

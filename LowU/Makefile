@@ -5,7 +5,8 @@ CC := g++-14
 CXXFLAGS := -std=c++17 -fpermissive -O3 -g -fopenmp
 
 #---------------------------------------------------------------------------#
-# FFTW (Homebrew)
+# Dependencies (Homebrew): fftw, eigen, boost
+#   brew install fftw eigen boost
 #---------------------------------------------------------------------------#
 HOMEBREW_PREFIX ?= $(shell brew --prefix)
 FFTW_INC        := -I$(HOMEBREW_PREFIX)/include
@@ -14,13 +15,13 @@ FFTW_LIB        := -L$(HOMEBREW_PREFIX)/lib -lfftw3
 #---------------------------------------------------------------------------#
 # Project includes & libs
 #---------------------------------------------------------------------------#
-INCS := -I/usr/include \
-        $(FFTW_INC) \
-        -I$(HOME)/Desktop/C_plusplus/codes/boltzmann/standalone_ness_mio/
+INCS := -I/usr/include $(FFTW_INC)
 LIBS := $(FFTW_LIB)
 
 #---------------------------------------------------------------------------#
-# Dependencies
+# ness_*.hpp/.cpp: vendored, standalone subset of the NESSi library used by
+# A. Picano, J. Li and M. Eckstein, Phys. Rev. B 104, 085108 (2021) -- see
+# the top-level README for the full reference.
 #---------------------------------------------------------------------------#
 NESS_SRCS    := ness.cpp
 NESS_HEADERS := ness.hpp ness_utils.hpp \

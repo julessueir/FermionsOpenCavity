@@ -13,35 +13,32 @@ import numpy as np
 # ================================================================
 
 base_params = {
-    "numOfFreq":   50000,
-    "freq_cutoff": 50.0,
-    "nk":          500, # best around 400 to 500
-    "t_hop":       2.5,  # In the normal phase the DoS goes from - 2t to 2t. 
-    "mu":          0.0,
-    "eps_perp":    0.0,
-    "delta_cav":   5.0,
-    "Gamma_cav":   5.0,
-    "g_cav":       0.0, # controls the mean-field (Hartree) term
-    "g_eff_sq":    0.025, # controls the fluctuations.
-    "Jbath":       0.025,
-    "beta":        3.0,
-    "Niter":       300,
-    "mixing":      0.5,
-    "err":         1e-7,
+    "numOfFreq":   50000, # number of frequency point in the integration grid
+    "freq_cutoff": 50.0, # frequency points go from - freq_cutoff to freq_cutoff, it should be kept larger than the bandwidth of the system. To low of a frequency cutoff leads to clear breking of the spectral sum rule. 
+    "nk":          500, # number of k points used in the self-concistency step to get G_loc from Sigma_loc. Best around 400 to 500. 
+    "t_hop":       2.5, # Hopping. In the normal phase, the DoS goes from - 2t to 2t. 
+    "mu":          0.0, # Chemical potential. mu = 0 at half-filling. 
+    "eps_perp":    0.0, # no perpandicular energy.
+    "delta_cav":   5.0, # Cavity frequency.
+    "Gamma_cav":   5.0, # Cavity losses.
+    "g_cav":       0.0, # Controls the mean-field (Hartree) term
+    "g_eff_sq":    0.025, # Controls the fluctuations.
+    "Jbath":       0.025, # Coupling to the bath used to initialize the Green's functions with finite imaginary part and Keldysh component. 
+    "beta":        3.0, # Temperature of the bath used to initialize.
+    "Niter":       300, # Maximal number of iterations for the loop to converge.
+    "mixing":      0.25, # Mixing the old and the new GF when updating the GF. G_n+1 = (1 - mixing)* G_new + mixing* G_n. 0 is the fastest but least stable, 1 doesn't update.
+    "err":         1e-7, # Error at whoch the loop is considered to have converged. 
 }
+
+plot = True # Whether to run the "plot_crossover.py" scipt after the simulation to plot the results. 
 
 # ================================================================
 # Values of U to scan
 # ================================================================
 
-# U_values = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
-U_values = list((np.linspace(0.0, 2.5, num = 6, endpoint = True)) )
-U_values = [0.0, 0.25, 0.5, 1.0, 1.75 , 2.5]
-# U_values = [0.]
-# U_values = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0 ]
-# U_values = [0.0, 0.25, 0.5 , 0.75, 1.0 ]
-# U_values = [0.0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2.0]
-# U_values = list(np.sqrt(np.linspace(0.0, 1.0, num = 6, endpoint = True)) )
+
+U_values = [0.0, 0.25, 0.5, 1.0, 1.75, 2.5]
+
 
 # ================================================================
 # Helpers
@@ -140,4 +137,5 @@ print(f"  U_values: {U_arr.shape}")
 print(f"  GR: {GR_arr.shape}  (n_U, n_omega, 2, 2)")
 print(f"  GL: {GL_arr.shape}")
 
-subprocess.run(["python", "plot_crossover.py"],cwd=script_dir, check=True)
+if plot : 
+    subprocess.run(["python", "plot_crossover.py"],cwd=script_dir, check=True)  # Plot the run 
